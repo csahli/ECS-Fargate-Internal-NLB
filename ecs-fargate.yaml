@@ -1,0 +1,260 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Deploy a service on AWS Fargate, hosted in a private subnet, but accessible via a private network load balancer
+# based on the original cloudformation template created by Erin Mcgill and Nathan Peck.
+# adapted by Chaouki SAHLI
+
+Parameters:
+    VPCPrivateSubnets:
+      Description: Private subnets located in 2 AZ
+      Type: List<AWS::EC2::Subnet::Id>
+    VPC:
+      Description: VPC
+      Type: AWS::EC2::VPC::Id
+    ServicePrefix:
+      Type: String
+      Default: Fargate-service
+      Description: A name for the Fargate service
+    RepositoryURI:
+      Type: String
+      Default: 910537616703.dkr.ecr.ca-central-1.amazonaws.com/sprinboot-sample:latest
+      Description: The repository URI of the docker image that contains the application process that will handle the traffic for this service, ex. nginx
+    ContainerPort:
+      Type: Number
+      Default: 8443
+      Description: What port number the application inside the docker container is binding to
+    ContainerCpu:
+      Type: Number
+      Default: 1024
+      Description: How much CPU to give the container. 1024 is 1 CPU
+    ContainerMemory:
+      Type: Number
+      Default: 2048
+      Description: How much memory in megabytes to give the container
+    DesiredCount:
+      Type: Number
+      Default: 2
+      Description: How many copies of the service task to run
+    SourceAccessCIDR:
+      Type: String
+      Description: The CIDR IP range that is permitted to access the running tasks. We recommend that you set this value to a trusted IP range.
+      Default: 0.0.0.0/0
+    LBListenerPort:
+      Type: Number
+      Default: 443
+      Description: What port number the LB is listening to      
+Resources:
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Join ['-', [!Ref ServicePrefix, !Ref 'AWS::StackName']]
+      Cpu: !Ref ContainerCpu
+      Memory: !Ref ContainerMemory
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !Ref ECSTaskExecutionRole
+      TaskRoleArn: !Ref "AWS::NoValue"
+      ContainerDefinitions:
+        - Name: !Join ['-', [!Ref ServicePrefix, !Ref 'AWS::StackName']]
+          Cpu: !Ref ContainerCpu
+          Memory: !Ref ContainerMemory
+          Image: !Ref RepositoryURI
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+#          HealthCheck:
+#            Command: [ "SHELL", "netstat -an | grep 8443 | grep LISTEN > /dev/null && echo ok || exit 1" ]
+#            Interval: 10
+#            Retries: 3
+#            StartPeriod: 300
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Join ['/', [ecs, !Join ['-', [!Ref ServicePrefix, !Ref 'AWS::StackName']]]]
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+  # The service. The service is a resource which allows you to run multiple
+  # copies of a type of task, and gather up their logs and metrics, as well
+  # as monitor the number of running tasks and replace any that have crashed
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: LoadBalancerListener
+    Properties:
+      ServiceName: !Join ['-', [!Ref ServicePrefix, !Ref 'AWS::StackName']]
+      Cluster: !Ref ECSCluster
+      LaunchType: FARGATE
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 75
+      DesiredCount: !Ref DesiredCount
+      HealthCheckGracePeriodSeconds: 600
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - !Ref FargateContainerSecurityGroup
+          Subnets: !Ref VPCPrivateSubnets
+      TaskDefinition: !Ref TaskDefinition
+      LoadBalancers:
+        - ContainerName: !Join ['-', [!Ref ServicePrefix, !Ref 'AWS::StackName']]
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref TargetGroup
+
+# This is an IAM role which authorizes ECS to manage resources on your
+# account on your behalf, such as updating your load balancer with the
+# details of where your containers are, so that traffic can reach your
+# containers.
+  ECSRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: [ecs.amazonaws.com]
+          Action: ['sts:AssumeRole']
+      Path: /
+      Policies:
+      - PolicyName: ecs-service
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action:
+              # Rules which allow ECS to attach network interfaces to instances
+              # on your behalf in order for awsvpc networking mode to work right
+              - 'ec2:AttachNetworkInterface'
+              - 'ec2:CreateNetworkInterface'
+              - 'ec2:CreateNetworkInterfacePermission'
+              - 'ec2:DeleteNetworkInterface'
+              - 'ec2:DeleteNetworkInterfacePermission'
+              - 'ec2:Describe*'
+              - 'ec2:DetachNetworkInterface'
+
+              # Rules which allow ECS to update load balancers on your behalf
+              # with the information sabout how to send traffic to your containers
+              - 'elasticloadbalancing:DeregisterInstancesFromLoadBalancer'
+              - 'elasticloadbalancing:DeregisterTargets'
+              - 'elasticloadbalancing:Describe*'
+              - 'elasticloadbalancing:RegisterInstancesWithLoadBalancer'
+              - 'elasticloadbalancing:RegisterTargets'
+            Resource: '*'
+
+# This is a role which is used by the ECS tasks themselves.
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: [ecs-tasks.amazonaws.com]
+          Action: ['sts:AssumeRole']
+      Path: /
+      Policies:
+        - PolicyName: AmazonECSTaskExecutionRolePolicy
+          PolicyDocument:
+            Statement:
+            - Effect: Allow
+              Action:
+                # Allow the ECS Tasks to download images from ECR
+                - 'ecr:GetAuthorizationToken'
+                - 'ecr:BatchCheckLayerAvailability'
+                - 'ecr:GetDownloadUrlForLayer'
+                - 'ecr:BatchGetImage'
+                # Allow the ECS tasks to upload logs to CloudWatch
+                - 'logs:CreateLogStream'
+                - 'logs:PutLogEvents'
+              Resource: '*'
+
+# Fargate Security Groups
+  FargateContainerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Access to the Fargate containers
+      VpcId: !Ref VPC
+  EcsSecurityGroupIngressFromClient:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Ingress from external clients
+      GroupId: !Ref FargateContainerSecurityGroup
+      CidrIp: !Ref SourceAccessCIDR
+      FromPort: !Ref ContainerPort
+      ToPort: !Ref ContainerPort
+      IpProtocol: tcp
+  EcsSecurityGroupIngressFromSelf:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Ingress from other containers in the same security group
+      GroupId: !Ref FargateContainerSecurityGroup
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref FargateContainerSecurityGroup
+  ServiceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+        LogGroupName: !Join ['/', [ecs, !Join ['-', [!Ref ServicePrefix, !Ref 'AWS::StackName']]]]
+        RetentionInDays: 14
+
+  NetworkLoadBalancerSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Access to the public facing load balancer
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+          # Allow access to ALB from anywhere on the internet
+          - CidrIp: 0.0.0.0/0
+            IpProtocol: tcp
+            FromPort: !Ref ContainerPort
+            ToPort: !Ref ContainerPort
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 30
+      HealthCheckProtocol: TCP
+      HealthyThresholdCount: 5
+      UnhealthyThresholdCount: 5
+      TargetType: ip
+      # Only use the stack name here because the full name can only be 32 characters, service prefix + stack name is often too long
+      Name: !Ref AWS::StackName
+      Port: !Ref ContainerPort
+      Protocol: TCP
+      VpcId: !Ref VPC
+  # Create a rule on the load balancer for routing traffic to the target group
+  LoadBalancerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref TargetGroup
+          Type: forward
+      LoadBalancerArn: !Ref NetworkLoadBalancer
+      Port: !Ref LBListenerPort
+      Protocol: TCP
+  NetworkLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internal
+      Subnets: !Ref VPCPrivateSubnets
+      Tags:
+        -
+          Key: StackName
+          Value: !Ref AWS::StackName
+      Type: network
+
+Outputs:
+  ClusterName:
+    Description: The name of the ECS Fargate cluster
+    Value: !Ref 'ECSCluster'
+    Export:
+      Name: !Join [ ':', [ !Ref 'AWS::StackName', 'ClusterName' ] ]
+  InternalUrl:
+    Description: The URL of the internal load balancer
+    Value: !Join ['', ['http://', !GetAtt 'NetworkLoadBalancer.DNSName']]
+    Export:
+      Name: !Join [ ':', [ !Ref 'AWS::StackName', 'InternalUrl' ] ]
+  NLBEndpoint:
+    Description: The ARN of the Network Load Balancer
+    Value: !Ref NetworkLoadBalancer
+    Export:
+      Name:
+        Fn::Sub: "${AWS::StackName}-NLBEndpoint"
